@@ -2,12 +2,17 @@ use std::future::Future;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use futures::future::BoxFuture;
+use futures::future::FutureExt;
+use observability::tracing;
+use observability::tracing::*;
 use tokio::task::JoinHandle;
 
 #[macro_export]
 macro_rules! spawn_limit {
     ($limit:expr) => {{
-        static SPAWN_LIMIT: $crate::SpawnLimit = $crate::SpawnLimit::new($limit);
+        static SPAWN_LIMIT: $crate::SpawnLimit =
+            $crate::SpawnLimit::new($limit).with_location(file!(), line!());
         &SPAWN_LIMIT
     }};
 }
@@ -24,6 +29,7 @@ pub struct SpawnLimit {
     limit: usize,
     ordering: Ordering,
     current: AtomicUsize,
+    location: Option<(&'static str, u32)>,
 }
 
 #[derive(Debug)]
@@ -31,22 +37,76 @@ pub struct SpawnGuard {
     limit: Option<&'static SpawnLimit>,
 }
 
+pub enum Spawn<T>
+where
+    // T: Future + Send + 'static,
+    // T::Output: Send + 'static,
+    T: Send + 'static,
+{
+    Spawned(JoinHandle<T>),
+    InPlace(BoxFuture<'static, T>),
+}
+
+impl<T> Spawn<T>
+where
+    // T: Future + Send + 'static,
+    // T::Output: Send + 'static,
+    T: Send + 'static,
+{
+    /// Did this task successfully spawn?
+    pub fn is_spawned(&self) -> bool {
+        match &self {
+            Self::Spawned(_) => true,
+            Self::InPlace(_) => false,
+        }
+    }
+
+    #[instrument(skip(self))]
+    #[must_use]
+    /// If the task was spawned return the [`JoinHandle`] otherwise
+    /// await the task in place and wrap the output in a [`JoinHandle`].
+    pub async fn finish(self) -> JoinHandle<T> {
+        match self {
+            Self::Spawned(jh) => jh,
+            Self::InPlace(t) => {
+                let out = t.await;
+                tokio::task::spawn(async move { out })
+            }
+        }
+    }
+}
+
+#[instrument(skip(limit, task))]
 /// Spawn tasks up to a limit.
-/// If the limit is passed then await the task in place.
+// / If the limit is passed then await the task in place.
+// pub async fn spawn_with_limit<T>(limit: &'static SpawnLimit, task: BoxFuture<'static, T>) -> JoinHandle<T>
 pub async fn spawn_with_limit<T>(limit: &'static SpawnLimit, task: T) -> JoinHandle<T::Output>
 where
     T: Future + Send + 'static,
     T::Output: Send + 'static,
+    // T: Send + 'static,
+{
+    spawn_attempt_limit(limit, task.boxed()).finish().await
+}
+
+#[instrument(skip(limit, task))]
+/// Similar to [`spawn_try_limit`] with [`Spawn`] helper to run in task in place
+/// if limit has been reached.
+pub fn spawn_attempt_limit<T>(limit: &'static SpawnLimit, task: BoxFuture<'static, T>) -> Spawn<T>
+where
+    // T: Future + Send + 'static,
+    // T::Output: Send + 'static,
+    T: Send + 'static,
 {
     if limit.try_add_task() {
-        tokio::task::spawn(async move {
+        let h = tokio::task::spawn(async move {
             let o = task.await;
             limit.task_finished();
             o
-        })
+        });
+        Spawn::Spawned(h)
     } else {
-        let out = task.await;
-        tokio::task::spawn(async move { out })
+        Spawn::InPlace(task)
     }
 }
 
@@ -77,16 +137,21 @@ impl SpawnLimit {
             limit,
             ordering: Ordering::Relaxed,
             current: AtomicUsize::new(0),
+            location: None,
         }
     }
     /// Create a new limit with an atomic ordering.
-    pub fn with_ordering(limit: usize, ordering: Ordering) -> Self {
-        Self {
-            limit,
-            ordering,
-            current: AtomicUsize::new(0),
-        }
+    pub const fn with_ordering(mut self, ordering: Ordering) -> Self {
+        self.ordering = ordering;
+        self
     }
+
+    /// Give this limit a location in the code for debugging.
+    pub const fn with_location(mut self, file: &'static str, line: u32) -> Self {
+        self.location = Some((file, line));
+        self
+    }
+
     /// Check if the current limit has been reached.
     pub fn is_full(&self) -> bool {
         self.current.load(self.ordering) >= self.limit
@@ -105,6 +170,11 @@ impl SpawnLimit {
     /// Show the limit
     pub fn show_limit(&self) -> usize {
         self.limit
+    }
+
+    /// Show the location of this limit if there is one.
+    pub fn show_location(&self) -> Option<(&'static str, u32)> {
+        self.location.clone()
     }
 
     fn try_add_task(&self) -> bool {
@@ -129,16 +199,21 @@ impl SpawnLimit {
             })
             .ok();
     }
+    #[allow(dead_code)]
+    fn show(&self) -> usize {
+        self.current.load(self.ordering)
+    }
 }
 
 impl SpawnGuard {
-    pub fn spawn<T>(self, task: T) -> JoinHandle<T::Output>
+    pub fn spawn<T>(mut self, task: T) -> JoinHandle<T::Output>
     where
         T: Future + Send + 'static,
         T::Output: Send + 'static,
     {
         let limit = self
             .limit
+            .take()
             .expect("SpawnGuard created without limit. This is a bug");
         tokio::task::spawn(async move {
             let o = task.await;
@@ -194,5 +269,21 @@ mod tests {
         assert!(b.try_add_task());
         assert!(!a.is_full());
         assert!(b.is_full());
+    }
+
+    #[test]
+    fn take_limit() {
+        let a = spawn_limit!(2);
+        let first = a.take_limit();
+        assert!(first.is_some());
+        let g = a.take_limit();
+        assert!(g.is_some());
+        let g = a.take_limit();
+        assert!(g.is_none());
+        std::mem::drop(first);
+        let g = a.take_limit();
+        assert!(g.is_some());
+        let g = a.take_limit();
+        assert!(g.is_none());
     }
 }
