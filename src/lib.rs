@@ -6,6 +6,7 @@ use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use observability::tracing;
 use observability::tracing::*;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 #[macro_export]
@@ -30,6 +31,7 @@ pub struct SpawnLimit {
     ordering: Ordering,
     current: AtomicUsize,
     location: Option<(&'static str, u32)>,
+    semaphore: once_cell::race::OnceBox<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -94,8 +96,6 @@ where
 /// if limit has been reached.
 pub fn spawn_attempt_limit<T>(limit: &'static SpawnLimit, task: BoxFuture<'static, T>) -> Spawn<T>
 where
-    // T: Future + Send + 'static,
-    // T::Output: Send + 'static,
     T: Send + 'static,
 {
     if limit.try_add_task() {
@@ -108,6 +108,35 @@ where
     } else {
         Spawn::InPlace(task)
     }
+}
+
+#[instrument(skip(limit, task, if_full))]
+/// For long running tasks that you want to await when the limit is hit
+/// but always want spawn once there is a place in the queue.
+/// This has more overhead then the other calls.
+///
+/// `is_full` closure will run before await if the limit has been hit.
+/// There could be races with `is_full` so use as a guide and don't rely
+/// on it actually awaiting before spawning.
+pub async fn spawn_queue_limit<T, F>(
+    limit: &'static SpawnLimit,
+    if_full: F,
+    task: BoxFuture<'static, T>,
+) -> JoinHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce(),
+{
+    let (semaphore, full) = limit.add_task();
+    if full {
+        if_full()
+    }
+    let guard = semaphore.acquire().await;
+    tokio::task::spawn(async move {
+        let o = task.await;
+        std::mem::drop(guard);
+        o
+    })
 }
 
 /// Try to spawn a task if the limit has not been reached.
@@ -138,6 +167,7 @@ impl SpawnLimit {
             ordering: Ordering::Relaxed,
             current: AtomicUsize::new(0),
             location: None,
+            semaphore: once_cell::race::OnceBox::new(),
         }
     }
     /// Create a new limit with an atomic ordering.
@@ -152,8 +182,9 @@ impl SpawnLimit {
         self
     }
 
+    #[cfg(test)]
     /// Check if the current limit has been reached.
-    pub fn is_full(&self) -> bool {
+    fn is_full(&self) -> bool {
         self.current.load(self.ordering) >= self.limit
     }
 
@@ -175,6 +206,14 @@ impl SpawnLimit {
     /// Show the location of this limit if there is one.
     pub fn show_location(&self) -> Option<(&'static str, u32)> {
         self.location.clone()
+    }
+
+    fn add_task(&'static self) -> (&Semaphore, bool) {
+        let semaphore = self
+            .semaphore
+            .get_or_init(|| Box::new(Semaphore::new(self.limit)));
+        let full = semaphore.available_permits() == 0;
+        (semaphore, full)
     }
 
     fn try_add_task(&self) -> bool {

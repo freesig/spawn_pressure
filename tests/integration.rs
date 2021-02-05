@@ -85,6 +85,43 @@ async fn macros() {
 }
 
 #[tokio::test(threaded_scheduler)]
+async fn queues() {
+    let num_running = Arc::new(AtomicUsize::new(0));
+    let most_running = Arc::new(AtomicUsize::new(0));
+
+    let mut jhs = Vec::new();
+    for _ in 0..4 {
+        jhs.push(do_work_queue(num_running.clone(), most_running.clone()).await);
+    }
+
+    for jh in jhs {
+        jh.await.unwrap();
+    }
+
+    // Can only have 2 spawned at any moment
+    assert_eq!(most_running.load(Ordering::SeqCst), 2);
+
+    let num_running2 = Arc::new(AtomicUsize::new(0));
+    let most_running2 = Arc::new(AtomicUsize::new(0));
+
+    let mut jhs = Vec::new();
+    for _ in 0..5 {
+        jhs.push(do_work_other_queue(num_running2.clone(), most_running2.clone()).await);
+        jhs.push(do_work_queue(num_running.clone(), most_running.clone()).await);
+    }
+
+    for jh in jhs {
+        jh.await.unwrap();
+    }
+
+    // Check they don't interfere
+    // First can have 2 spawned running at any moment
+    assert_eq!(most_running.load(Ordering::SeqCst), 2);
+    // Second can have 3 spawned running at any moment
+    assert_eq!(most_running2.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(threaded_scheduler)]
 async fn with_recursive() {
     let _g = observability::test_run();
     let num_running = Arc::new(AtomicUsize::new(0));
@@ -154,6 +191,43 @@ async fn do_work_other_m(
     let limit = spawn_limit!(3);
     spawn_with_limit(
         limit,
+        async move {
+            let running = num_running.fetch_add(1, Ordering::SeqCst) + 1;
+            most_running.fetch_max(running, Ordering::SeqCst);
+            tokio::time::delay_for(Duration::from_secs(2)).await;
+            num_running.fetch_sub(1, Ordering::SeqCst);
+        }
+        .boxed(),
+    )
+    .await
+}
+
+async fn do_work_queue(
+    num_running: Arc<AtomicUsize>,
+    most_running: Arc<AtomicUsize>,
+) -> JoinHandle<()> {
+    spawn_queue_limit(
+        spawn_limit!(2),
+        || debug!("full"),
+        async move {
+            let running = num_running.fetch_add(1, Ordering::SeqCst) + 1;
+            most_running.fetch_max(running, Ordering::SeqCst);
+            tokio::time::delay_for(Duration::from_secs(1)).await;
+            num_running.fetch_sub(1, Ordering::SeqCst);
+        }
+        .boxed(),
+    )
+    .await
+}
+
+async fn do_work_other_queue(
+    num_running: Arc<AtomicUsize>,
+    most_running: Arc<AtomicUsize>,
+) -> JoinHandle<()> {
+    let limit = spawn_limit!(3);
+    spawn_queue_limit(
+        limit,
+        || debug!("full {:?}", limit.show_location()),
         async move {
             let running = num_running.fetch_add(1, Ordering::SeqCst) + 1;
             most_running.fetch_max(running, Ordering::SeqCst);
